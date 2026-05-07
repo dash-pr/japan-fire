@@ -1,31 +1,10 @@
-// ─── Tax brackets ─────────────────────────────────────────────────────────────
-const TAX_BRACKETS = [
-  { upTo: 1_950_000, rate: 0.05 },
-  { upTo: 3_300_000, rate: 0.10 },
-  { upTo: 6_950_000, rate: 0.20 },
-  { upTo: 9_000_000, rate: 0.23 },
-  { upTo: 18_000_000, rate: 0.33 },
-  { upTo: 40_000_000, rate: 0.40 },
-  { upTo: Infinity,   rate: 0.45 },
-]
-
-function computeIncomeTax(taxableAnnual) {
-  let remaining = taxableAnnual, tax = 0, lower = 0
-  for (const b of TAX_BRACKETS) {
-    const chunk = Math.max(0, Math.min(remaining, b.upTo - lower))
-    if (chunk > 0) tax += chunk * b.rate
-    remaining -= chunk
-    lower = b.upTo
-    if (remaining <= 0) break
-  }
-  return tax
-}
-
-function marginalRate(netMonthly) {
-  // Approximate combined marginal rate at a given net monthly salary level
-  if (netMonthly < 700_000) return 0.43
-  if (netMonthly < 850_000) return 0.46
-  return 0.48
+function iDeCoMarginalRate(netMonthly) {
+  // Approximate marginal tax rate for iDeCo deduction benefit
+  // = marginal income tax rate * 1.021 (reconstruction tax) + 10% residence tax
+  // Based on net monthly salary (post income tax, post social insurance)
+  if (netMonthly <= 720_000) return 0.3042   // 20% income tax bracket + 10% residence
+  if (netMonthly <= 920_000) return 0.3348   // 23% income tax bracket + 10% residence
+  return 0.4369                               // 33% income tax bracket + 10% residence
 }
 
 export function calculateMortgagePayment(P, annualRate, years) {
@@ -133,6 +112,7 @@ export const DEFAULTS = {
 
   showNominal: false,
   showNenkin: false,
+  nenkinMonthly: 175_000,
 
   customScenario: {
     realReturn: 5,
@@ -158,11 +138,14 @@ export const DEFAULTS = {
  */
 export function runSimulation(params, scCfg, opts = {}) {
   const sc = typeof scCfg === 'string' ? getScenarioConfig(params, scCfg) : scCfg
-  const { lifeEvents = [], bridgePhase = null, cutOverrides = {} } = opts
+  const { lifeEvents = [], bridgePhase = null, cutOverrides = {}, returnOverrides = null } = opts
 
   const p = { ...params, ...cutOverrides }
   const endAge = 90
   const realReturn = sc.realReturn / 100
+  const inflation = (sc.inflation ?? p.inflation) / 100
+  const CAPITAL_GAINS_TAX = 0.20315
+  const taxableReturn = realReturn * (1 - CAPITAL_GAINS_TAX)
   const hike = sc.mortgageHike ?? null
   const userShare = 1 - p.partnerHousingShare / 100
 
@@ -181,6 +164,9 @@ export function runSimulation(params, scCfg, opts = {}) {
 
   for (let age = p.startAge; age <= endAge; age++) {
     const yearsPassed = age - p.startAge
+    const deflator = Math.pow(1 + inflation, yearsPassed)
+    const thisYearReturn = returnOverrides ? returnOverrides[yearsPassed] : realReturn
+    const thisYearTaxableReturn = returnOverrides ? thisYearReturn * (1 - CAPITAL_GAINS_TAX) : taxableReturn
 
     // ── Income ───────────────────────────────────────────────────────────────
     const growthSteps = Math.floor(yearsPassed / growthStep)
@@ -209,7 +195,7 @@ export function runSimulation(params, scCfg, opts = {}) {
       mortgageBalance = p.propertyValue
       mortgagePaymentMonthly = calculateMortgagePayment(p.propertyValue, currentMortgageRate, p.mortgageTerm)
     }
-    if (hike && age === hike.atAge && age > p.propertyPurchaseAge) {
+    if (hike && age === hike.atAge && age >= p.propertyPurchaseAge) {
       currentMortgageRate = hike.newRate / 100
       const remainingYears = p.mortgageTerm - (age - p.propertyPurchaseAge)
       mortgagePaymentMonthly = calculateMortgagePayment(mortgageBalance, currentMortgageRate, remainingYears)
@@ -221,23 +207,34 @@ export function runSimulation(params, scCfg, opts = {}) {
     const isOwner = age >= p.propertyPurchaseAge
     const travelMonthly = (p.skiTrips + p.domesticTrips + p.festivals + p.europeTrip + p.indiaTrip) / 12
 
-    const housing = isOwner ? mortgagePaymentMonthly * userShare : p.totalRentMonthly * userShare
+    const housing = isOwner ? (mortgagePaymentMonthly / deflator) * userShare : p.totalRentMonthly * userShare
     const condo = isOwner ? p.condoManagementFee : 0
     const propTax = isOwner ? p.propertyTaxAnnual / 12 : 0
     const utilities = p.totalUtilitiesMonthly * userShare
     const phone = p.phoneInternet
 
+    // Life events: recurring monthly expenses (e.g. kids)
+    let recurringExpenses = 0
+    let lifestyleMultiplier = 1
+    for (const ev of lifeEvents) {
+      if (ev.type === 'recurringExpense' && age >= ev.age && (!ev.endAge || age < ev.endAge)) {
+        recurringExpenses += ev.amount
+        if (ev.lifestyleReduction) lifestyleMultiplier *= (1 - ev.lifestyleReduction)
+      }
+    }
+
+    const lifestyle = (p.fineDining + p.drinking + p.personalCare) * lifestyleMultiplier
     const totalExpenses = housing + utilities + phone + condo + propTax +
-      p.groceries + p.transport + p.personalCare + p.fineDining + p.drinking + travelMonthly
+      p.groceries + p.transport + lifestyle + travelMonthly + recurringExpenses
 
     // ── Home loan deduction (ages 40–52, ¥17,500/mo) ──────────────────────
-    const homeLoanDeduction = (isOwner && age <= p.propertyPurchaseAge + 12) ? 17_500 : 0
+    const homeLoanDeduction = (isOwner && age <= p.propertyPurchaseAge + 12) ? 17_500 / deflator : 0
 
     // ── Investable ────────────────────────────────────────────────────────
     const investable = Math.max(0, netMonthly - residenceTax - totalExpenses + homeLoanDeduction)
 
     // ── iDeCo tax saving ──────────────────────────────────────────────────
-    const iDeCoTaxSaving = Math.round(p.iDeCoMonthly * 12 * marginalRate(netMonthly))
+    const iDeCoTaxSaving = Math.round(p.iDeCoMonthly * 12 * iDeCoMarginalRate(netMonthly))
 
     // ── Portfolio compounding ─────────────────────────────────────────────
     let iDeCoContribYear = 0, nisaContribYear = 0, taxableContribYear = 0
@@ -250,21 +247,22 @@ export function runSimulation(params, scCfg, opts = {}) {
       taxableContribYear = Math.max(0, afterIDeco - nisaContribYear)
       nisaLifetimeUsed += nisaContribYear
 
-      iDeCo = iDeCo * (1 + realReturn) + iDeCoContribYear
-      nisa = nisa * (1 + realReturn) + nisaContribYear
-      taxable = taxable * (1 + realReturn) + taxableContribYear
+      iDeCo = iDeCo * (1 + thisYearReturn) + iDeCoContribYear
+      nisa = nisa * (1 + thisYearReturn) + nisaContribYear
+      taxable = taxable * (1 + thisYearTaxableReturn) + taxableContribYear
 
       if (age === p.propertyPurchaseAge) taxable = Math.max(0, taxable - 650_000)
     } else {
-      const retirementExpenses = totalExpenses * 12
-      let withdrawal = retirementExpenses
+      const retirementExpenses = (totalExpenses + residenceTax) * 12
+      const nenkinIncome = (p.showNenkin && age >= 65) ? (p.nenkinMonthly / deflator) * 12 : 0
+      let withdrawal = Math.max(0, retirementExpenses - nenkinIncome)
       const fromTaxable = Math.min(taxable, withdrawal)
       taxable = Math.max(0, taxable - fromTaxable); withdrawal -= fromTaxable
       if (withdrawal > 0) { const f = Math.min(nisa, withdrawal); nisa = Math.max(0, nisa - f); withdrawal -= f }
       if (withdrawal > 0 && age >= 60) { const f = Math.min(iDeCo, withdrawal); iDeCo = Math.max(0, iDeCo - f) }
-      iDeCo = iDeCo * (1 + realReturn)
-      nisa = nisa * (1 + realReturn)
-      taxable = taxable * (1 + realReturn)
+      iDeCo = iDeCo * (1 + thisYearReturn)
+      nisa = nisa * (1 + thisYearReturn)
+      taxable = taxable * (1 + thisYearTaxableReturn)
     }
 
     // Life events: windfalls and one-time expenses
@@ -286,10 +284,13 @@ export function runSimulation(params, scCfg, opts = {}) {
     }
 
     // ── FatFIRE target ────────────────────────────────────────────────────
-    const realAnnualExpenses = totalExpenses * 12
-    const fatFireTarget = Math.round((realAnnualExpenses / (p.swr / 100)) * (1 + p.swrBuffer / 100))
+    const realAnnualExpenses = (totalExpenses + residenceTax) * 12
+    const nenkinOffset = (p.showNenkin && age >= 65) ? (p.nenkinMonthly / deflator) * 12 : 0
+    const netExpensesForTarget = Math.max(0, realAnnualExpenses - nenkinOffset)
+    const fatFireTarget = Math.round((netExpensesForTarget / (p.swr / 100)) * (1 + p.swrBuffer / 100))
     const totalPortfolio = iDeCo + nisa + taxable
-    const netWorth = totalPortfolio - mortgageBalance
+    const realMortgageBalance = mortgageBalance / deflator
+    const netWorth = totalPortfolio - realMortgageBalance
 
     if (!fireCrossed && totalPortfolio >= fatFireTarget) { fireCrossed = true; fireAge = age }
 
@@ -299,7 +300,7 @@ export function runSimulation(params, scCfg, opts = {}) {
       nisa: Math.round(nisa),
       taxable: Math.round(taxable),
       totalPortfolio: Math.round(totalPortfolio),
-      mortgageBalance: Math.round(mortgageBalance),
+      mortgageBalance: Math.round(realMortgageBalance),
       netWorth: Math.round(netWorth),
       netMonthly: Math.round(netMonthly),
       residenceTax: Math.round(residenceTax),
@@ -312,10 +313,11 @@ export function runSimulation(params, scCfg, opts = {}) {
       propTax: Math.round(propTax),
       groceries: Math.round(p.groceries),
       transport: Math.round(p.transport),
-      personalCare: Math.round(p.personalCare),
-      fineDining: Math.round(p.fineDining),
-      drinking: Math.round(p.drinking),
+      personalCare: Math.round(p.personalCare * lifestyleMultiplier),
+      fineDining: Math.round(p.fineDining * lifestyleMultiplier),
+      drinking: Math.round(p.drinking * lifestyleMultiplier),
       travel: Math.round(travelMonthly),
+      recurringExpenses: Math.round(recurringExpenses),
       iDeCoContrib: Math.round(iDeCoContribYear / 12),
       nisaContrib: Math.round(nisaContribYear / 12),
       taxableContrib: Math.round(taxableContribYear / 12),
