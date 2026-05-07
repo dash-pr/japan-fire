@@ -815,7 +815,7 @@ function TabMonteCarlo({ params, lifeEvents, bridgePhase }) {
               {result.stats.medianFireAge && (
                 <p className="text-xs text-gray-500 text-center mt-1">
                   Median FatFIRE age: <strong>{result.stats.medianFireAge}</strong> ·
-                  {fireAges => `${result.histogram.reduce((s,h)=>s+h.count,0)}`} of 500 paths reach FatFIRE before 90
+                  {result.histogram.reduce((s,h)=>s+h.count,0)} of 500 paths reach FatFIRE before 90
                 </p>
               )}
             </div>
@@ -827,7 +827,7 @@ function TabMonteCarlo({ params, lifeEvents, bridgePhase }) {
 }
 
 // ─── Tab 4: FatFIRE Projection ────────────────────────────────────────────────
-function TabFatFire({ simData, params, lifeEvents, bridgePhase, appliedCuts, setAppliedCuts, scenarios }) {
+function TabFatFire({ simData, params, lifeEvents, bridgePhase, setBridgePhase, appliedCuts, setAppliedCuts, scenarios }) {
   const [subTab, setSubTab] = useState('projection') // 'projection' | 'sensitivity'
 
   const allScenarios = scenarios
@@ -871,7 +871,7 @@ function TabFatFire({ simData, params, lifeEvents, bridgePhase, appliedCuts, set
 
       {subTab === 'projection' && <>
         {/* Bridge phase toggle */}
-        <BridgePhasePanel bridgePhase={bridgePhase} setBridgePhase={()=>{}} params={params} />
+        <BridgePhasePanel bridgePhase={bridgePhase} setBridgePhase={setBridgePhase} params={params} />
 
         <p className="text-xs text-gray-500">Solid = portfolio · Dashed = FatFIRE target · All in real 2026 ¥{params.showNominal?' (nominal)':''}</p>
         <div aria-label="FatFIRE projection chart" className="h-96">
@@ -1535,7 +1535,7 @@ export default function FatFIREOptimizer() {
         {/* Tab content */}
         <div className="flex-1 overflow-y-auto p-6">
           <div className="bg-white rounded-lg border p-5 min-h-full">
-            {activeTab==='fatfire'    && <TabFatFire simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} appliedCuts={appliedCuts} setAppliedCuts={setAppliedCuts} scenarios={scenarios} />}
+            {activeTab==='fatfire'    && <TabFatFire simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} setBridgePhase={setBridgePhase} appliedCuts={appliedCuts} setAppliedCuts={setAppliedCuts} scenarios={scenarios} />}
             {activeTab==='cashflow'   && <TabCashFlow simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} />}
             {activeTab==='networth'   && <TabNetWorth simData={simData} params={params} lifeEvents={lifeEvents} />}
             {activeTab==='budget'     && <TabBudget simData={simData} params={params} setParam={setParam} onReset={onReset} />}
