@@ -4,7 +4,7 @@ import {
   ComposedChart, XAxis, YAxis, Tooltip, ResponsiveContainer,
   CartesianGrid, ReferenceLine, ReferenceDot, Cell, PieChart, Pie,
 } from 'recharts'
-import { DEFAULTS, runSimulation, getScenarioConfig, SCENARIO_COLORS } from './simulation.js'
+import { DEFAULTS, runSimulation, getScenarioConfig, SCENARIO_COLORS, computeResidenceTax } from './simulation.js'
 import { generateSuggestions, computeGapMetrics, EXPENSE_CATEGORIES, TIER_ICONS, costInWorkingYears } from './gapAnalysis.js'
 import { runMonteCarlo } from './monteCarlo.js'
 
@@ -13,6 +13,7 @@ const C = SCENARIO_COLORS
 const PIE_COLORS = ['#6366f1','#3b82f6','#0ea5e9','#06b6d4','#14b8a6','#10b981',
   '#84cc16','#eab308','#f97316','#ef4444','#a855f7','#ec4899','#64748b','#94a3b8']
 const PRESET_SCENARIOS = ['bear','base','bull']
+const SCENARIO_DASHES = { bull: '', base: '8 4', bear: '4 4', custom: '2 2 6 2' }
 const ALL_TABS = [
   { id:'fatfire',  label:'FatFIRE' },
   { id:'cashflow', label:'Cash Flow' },
@@ -22,6 +23,25 @@ const ALL_TABS = [
   { id:'compare',  label:'Scenarios' },
   { id:'montecarlo', label:'Probability' },
 ]
+
+// ─── Error Boundary ───────────────────────────────────────────────────────────
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { hasError: false, error: null } }
+  static getDerivedStateFromError(error) { return { hasError: true, error } }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-8 text-center space-y-4">
+          <p className="text-red-600 font-semibold">Something went wrong</p>
+          <p className="text-sm text-gray-500">{this.state.error?.message}</p>
+          <button onClick={() => this.setState({ hasError: false, error: null })}
+            className="px-4 py-2 bg-teal-600 text-white rounded text-sm">Try again</button>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
 
 // ─── URL state persistence ──────────────────────────────────────────────────────
 function encodeState(state) {
@@ -53,39 +73,41 @@ function displayVal(realVal, age, params) {
 
 // ─── UI Primitives ──────────────────────────────────────────────────────────────
 function SliderRow({ label, value, min, max, step, unit='', onChange, decimals=1, helpText }) {
+  const id = React.useId()
   return (
     <div className="space-y-1">
       <div className="flex justify-between text-xs">
-        <span className="text-gray-600">{label}{helpText && <span className="ml-1 text-gray-400 cursor-help" title={helpText}>ⓘ</span>}</span>
+        <label htmlFor={id} className="text-gray-600">{label}{helpText && <span className="ml-1 text-gray-400 cursor-help" title={helpText}>ⓘ</span>}</label>
         <span className="font-medium text-gray-900">{typeof value==='number' ? value.toFixed(decimals) : value}{unit}</span>
       </div>
-      <input type="range" min={min} max={max} step={step} value={value}
+      <input id={id} type="range" min={min} max={max} step={step} value={value}
         onChange={e=>onChange(Number(e.target.value))} className="w-full h-1.5 accent-teal-600" />
     </div>
   )
 }
 
 function MoneyInput({ label, value, onChange, annual=false, helpText }) {
+  const id = React.useId()
   const [rawVal, setRaw] = useState(String(value))
   useEffect(() => setRaw(String(value)), [value])
-  const commit = () => { const n = Number(rawVal.replace(/,/g,'')); if (!isNaN(n)) onChange(n) }
+  const commit = () => { const n = Number(rawVal.replace(/,/g,'')); if (!isNaN(n) && n >= 0) onChange(n) }
   return (
     <div className="space-y-0.5">
       <div className="flex items-center justify-between text-xs text-gray-600">
-        <span>{label}</span>
+        <label htmlFor={id}>{label}</label>
         {annual && <span className="text-gray-400">annual</span>}
         {helpText && <span className="text-gray-400 cursor-help" title={helpText}>ⓘ</span>}
       </div>
       <div className="flex items-center border rounded px-2 py-1 bg-white focus-within:ring-1 focus-within:ring-teal-400">
         <span className="text-gray-400 text-xs mr-1">¥</span>
-        <input type="text" value={rawVal}
+        <input id={id} type="text" value={rawVal}
           onChange={e=>setRaw(e.target.value)}
           onBlur={commit} onKeyDown={e=>e.key==='Enter' && commit()}
           className="w-full outline-none text-xs" />
         <div className="flex flex-col ml-1">
-          <button className="text-gray-400 hover:text-gray-600 leading-none text-[10px]"
+          <button type="button" className="text-gray-400 hover:text-gray-600 leading-none text-[10px]"
             onClick={()=>onChange(value + (annual?10000:1000))}>▲</button>
-          <button className="text-gray-400 hover:text-gray-600 leading-none text-[10px]"
+          <button type="button" className="text-gray-400 hover:text-gray-600 leading-none text-[10px]"
             onClick={()=>onChange(Math.max(0, value - (annual?10000:1000)))}>▼</button>
         </div>
       </div>
@@ -108,10 +130,12 @@ function Section({ title, children, defaultOpen=false, badge }) {
 function Toggle({ label, checked, onChange }) {
   return (
     <label className="flex items-center gap-2 text-xs cursor-pointer">
-      <div className={`relative w-8 h-4 rounded-full transition-colors ${checked ? 'bg-teal-600' : 'bg-gray-300'}`}
-        onClick={()=>onChange(!checked)}>
-        <div className={`absolute top-0.5 w-3 h-3 bg-white rounded-full shadow transition-transform ${checked ? 'translate-x-4' : 'translate-x-0.5'}`} />
-      </div>
+      <button type="button" role="switch" aria-checked={checked}
+        onClick={()=>onChange(!checked)}
+        onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); onChange(!checked) } }}
+        className={`relative w-8 h-4 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-teal-400 focus:ring-offset-1 ${checked ? 'bg-teal-600' : 'bg-gray-300'}`}>
+        <span className={`absolute top-0.5 w-3 h-3 bg-white rounded-full shadow transition-transform ${checked ? 'translate-x-4' : 'translate-x-0.5'}`} />
+      </button>
       <span className="text-gray-700">{label}</span>
     </label>
   )
@@ -138,7 +162,8 @@ function ProgressTracker({ simData, params, tracker, setTracker }) {
     ? simData.base.find(r => r.age === tracker.currentAge) ?? simData.base[0]
     : null
   const baseFireTarget = simData.base.find(r => r.fireCrossed)?.fatFireTarget ?? 0
-  const progress = baseFireTarget > 0 ? Math.min(100, Math.round((tracker.value / baseFireTarget) * 100)) : 0
+  const rawProgress = baseFireTarget > 0 ? (tracker.value / baseFireTarget) * 100 : 0
+  const progress = isNaN(rawProgress) || !isFinite(rawProgress) ? 0 : Math.min(100, Math.round(rawProgress))
   const aheadBehind = baseRow ? tracker.value - baseRow.totalPortfolio : 0
 
   return (
@@ -551,20 +576,28 @@ function SalaryROIPanel({ simData, params, lifeEvents, bridgePhase }) {
 // ─── Feature 6: Life Events Panel ─────────────────────────────────────────────
 function LifeEventsPanel({ lifeEvents, setLifeEvents, params }) {
   const [showForm, setShowForm] = useState(false)
-  const [form, setForm] = useState({ age:40, type:'windfall', amount:5_000_000, label:'Inheritance' })
+  const [form, setForm] = useState({ age:40, type:'windfall', amount:5_000_000, label:'Inheritance', endAge:null, lifestyleReduction:0 })
   const idRef = useRef(0)
 
   const add = () => {
-    setLifeEvents(evs => [...evs, { ...form, id: ++idRef.current }])
+    const ev = { ...form, id: ++idRef.current }
+    if (ev.type !== 'recurringExpense' && ev.type !== 'incomeChange') { delete ev.endAge; delete ev.lifestyleReduction }
+    if (ev.type !== 'recurringExpense') delete ev.lifestyleReduction
+    setLifeEvents(evs => [...evs, ev])
     setShowForm(false)
   }
   const remove = (id) => setLifeEvents(evs => evs.filter(e => e.id !== id))
 
   const HINTS = [
-    { label:'Inheritance ¥5M at 50', age:50, type:'windfall', amount:5_000_000 },
-    { label:'Car purchase ¥3M at 42', age:42, type:'expense', amount:3_000_000 },
-    { label:'Salary bump +¥50k at 35', age:35, type:'incomeChange', amount:50_000 },
+    { label:'First child at 35', age:35, type:'recurringExpense', amount:100_000, endAge:57, lifestyleReduction:0.30 },
+    { label:'Second child at 37', age:37, type:'recurringExpense', amount:80_000, endAge:59, lifestyleReduction:0.10 },
+    { label:'Inheritance ¥5M at 50', age:50, type:'windfall', amount:5_000_000, endAge:null, lifestyleReduction:0 },
+    { label:'Car purchase ¥3M at 42', age:42, type:'expense', amount:3_000_000, endAge:null, lifestyleReduction:0 },
+    { label:'Salary bump +¥50k at 35', age:35, type:'incomeChange', amount:50_000, endAge:null, lifestyleReduction:0 },
   ]
+
+  const isRecurring = form.type === 'recurringExpense'
+  const hasEndAge = form.type === 'recurringExpense' || form.type === 'incomeChange'
 
   return (
     <div className="border rounded-lg overflow-hidden">
@@ -595,12 +628,27 @@ function LifeEventsPanel({ lifeEvents, setLifeEvents, params }) {
                 <option value="windfall">Windfall (add to portfolio)</option>
                 <option value="expense">One-time expense (deduct)</option>
                 <option value="incomeChange">Income change (permanent, ¥/mo)</option>
+                <option value="recurringExpense">Recurring expense (¥/mo for a period)</option>
               </select>
             </div>
-            <SliderRow label="Age" value={form.age} min={params.startAge} max={89} step={1} decimals={0}
+            <SliderRow label="Start age" value={form.age} min={params.startAge} max={89} step={1} decimals={0}
               onChange={v=>setForm(f=>({...f,age:v}))} />
-            <MoneyInput label="Amount (¥)" value={form.amount} onChange={v=>setForm(f=>({...f,amount:v}))} />
+            <MoneyInput label={isRecurring ? "Monthly cost (¥)" : "Amount (¥)"} value={form.amount} onChange={v=>setForm(f=>({...f,amount:v}))} />
+            {hasEndAge && (
+              <SliderRow label="End age" value={form.endAge ?? form.age + 22} min={form.age+1} max={90} step={1} decimals={0}
+                onChange={v=>setForm(f=>({...f,endAge:v}))} />
+            )}
+            {isRecurring && (
+              <SliderRow label="Lifestyle cut %" value={Math.round((form.lifestyleReduction ?? 0) * 100)} min={0} max={60} step={5} unit="%" decimals={0}
+                helpText="Reduces dining/drinking/personal care during this period"
+                onChange={v=>setForm(f=>({...f,lifestyleReduction:v/100}))} />
+            )}
           </div>
+          {isRecurring && (
+            <p className="text-xs text-gray-500 bg-white rounded p-2 border">
+              Models ¥{formatJPY(form.amount)}/mo extra expenses from age {form.age} to {form.endAge ?? form.age+22}, with a {Math.round((form.lifestyleReduction??0)*100)}% reduction in dining/drinking/personal care during that period.
+            </p>
+          )}
           <div className="flex gap-2">
             <button onClick={add} className="bg-teal-600 text-white text-xs px-3 py-1.5 rounded hover:bg-teal-700">Add</button>
             <button onClick={()=>setShowForm(false)} className="border text-xs px-3 py-1.5 rounded text-gray-600">Cancel</button>
@@ -615,13 +663,15 @@ function LifeEventsPanel({ lifeEvents, setLifeEvents, params }) {
           {lifeEvents.map(ev => (
             <div key={ev.id} className="flex items-center justify-between px-4 py-2 text-xs">
               <div className="flex items-center gap-3">
-                <span className="text-gray-400 font-mono">Age {ev.age}</span>
+                <span className="text-gray-400 font-mono">Age {ev.age}{ev.endAge ? `–${ev.endAge}` : ''}</span>
                 <span className={`px-2 py-0.5 rounded text-xs font-medium ${
                   ev.type==='windfall' ? 'bg-green-100 text-green-700' :
                   ev.type==='expense' ? 'bg-red-100 text-red-700' :
+                  ev.type==='recurringExpense' ? 'bg-purple-100 text-purple-700' :
                   'bg-blue-100 text-blue-700'
-                }`}>{ev.type==='windfall'?'+':ev.type==='expense'?'−':'Δ'} ¥{formatJPY(ev.amount)}</span>
+                }`}>{ev.type==='windfall'?'+':ev.type==='expense'?'-':ev.type==='recurringExpense'?'¥/mo':'+-'} ¥{formatJPY(ev.amount)}{ev.type==='recurringExpense'?'/mo':''}</span>
                 <span className="text-gray-700">{ev.label}</span>
+                {ev.lifestyleReduction > 0 && <span className="text-purple-500 text-xs">(-{Math.round(ev.lifestyleReduction*100)}% lifestyle)</span>}
               </div>
               <button onClick={()=>remove(ev.id)} className="text-red-400 hover:text-red-600 text-xs">✕</button>
             </div>
@@ -642,7 +692,7 @@ function BudgetSettings({ params, setParam, onReset }) {
     (params.skiTrips + params.domesticTrips + params.festivals + params.europeTrip + params.indiaTrip) / 12
 
   const investableEst = Math.max(0,
-    params.initialNetMonthly - 46_000 - totalMonthly)
+    params.initialNetMonthly - computeResidenceTax(params.initialNetMonthly) - totalMonthly)
 
   return (
     <div className="border rounded-lg overflow-hidden">
@@ -707,6 +757,8 @@ function TabMonteCarlo({ params, lifeEvents, bridgePhase }) {
   const [progress, setProgress] = useState(0)
   const [result, setResult] = useState(null)
   const [scenario, setScenario] = useState('base')
+
+  useEffect(() => { setResult(null) }, [params])
 
   const run = async () => {
     setRunning(true); setProgress(0); setResult(null)
@@ -892,7 +944,7 @@ function TabFatFire({ simData, params, lifeEvents, bridgePhase, setBridgePhase, 
               {allScenarios.map(k=>(
                 <React.Fragment key={k}>
                   <Line type="monotone" dataKey={`${k}Portfolio`} name={`${k.charAt(0).toUpperCase()+k.slice(1)} portfolio`}
-                    stroke={C[k]} strokeWidth={2} dot={false} />
+                    stroke={C[k]} strokeWidth={2} dot={false} strokeDasharray={SCENARIO_DASHES[k]} />
                   <Line type="monotone" dataKey={`${k}Target`} name={`${k.charAt(0).toUpperCase()+k.slice(1)} target`}
                     stroke={C[k]} strokeWidth={1.5} dot={false} strokeDasharray="6 3" />
                   {crossings[k] && (
@@ -1261,7 +1313,13 @@ export default function FatFIREOptimizer() {
   const [params, setParams] = useState(initial?.params ?? DEFAULTS)
   const [lifeEvents, setLifeEvents] = useState(initial?.lifeEvents ?? [])
   const [bridgePhase, setBridgePhase] = useState(initial?.bridgePhase ?? { enabled:false, startAge:50, endAge:56, monthlyIncome:200_000 })
-  const [appliedCuts, setAppliedCuts] = useState({})
+  const [appliedCuts, setAppliedCuts] = useState(initial?.appliedCuts ?? {})
+
+  useEffect(() => {
+    setAppliedCuts({})
+  }, [params.groceries, params.transport, params.personalCare, params.fineDining, params.drinking,
+      params.phoneInternet, params.skiTrips, params.domesticTrips, params.festivals, params.europeTrip, params.indiaTrip])
+
   const [activeTab, setActiveTab] = useState('fatfire')
   const [tracker, setTracker] = useState({ enabled:false, currentAge:30, value:0 })
   const [savedPlans, setSavedPlans] = useState(() => {
@@ -1270,6 +1328,7 @@ export default function FatFIREOptimizer() {
   const [showSavedPlans, setShowSavedPlans] = useState(false)
   const [copyToast, setCopyToast] = useState(false)
   const [showLifeEvents, setShowLifeEvents] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
 
   const setParam = useCallback((key, val) => setParams(p => ({ ...p, [key]: val })), [])
   const setReturn_ = useCallback((s, v) => setParams(p => ({ ...p, returns: { ...p.returns, [s]: v } })), [])
@@ -1310,12 +1369,12 @@ export default function FatFIREOptimizer() {
   // URL persistence (debounced)
   useEffect(() => {
     const timer = setTimeout(() => {
-      const state = { params, lifeEvents, bridgePhase }
+      const state = { params, lifeEvents, bridgePhase, appliedCuts }
       const encoded = encodeState(state)
       if (encoded) window.location.hash = encoded
     }, 500)
     return () => clearTimeout(timer)
-  }, [params, lifeEvents, bridgePhase])
+  }, [params, lifeEvents, bridgePhase, appliedCuts])
 
   const copyShareLink = () => {
     navigator.clipboard.writeText(window.location.href).catch(() => {})
@@ -1344,7 +1403,12 @@ export default function FatFIREOptimizer() {
   return (
     <div className="flex h-screen overflow-hidden bg-gray-50 font-sans text-gray-900">
       {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
-      <aside className="w-72 flex-none overflow-y-auto bg-white border-r border-gray-200 px-4 py-5 space-y-3">
+      <aside className={`w-72 flex-none overflow-y-auto bg-white border-r border-gray-200 px-4 py-5 space-y-3 fixed inset-y-0 left-0 z-40 transform transition-transform lg:relative lg:translate-x-0 ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+        <button onClick={() => setSidebarOpen(false)} className="lg:hidden absolute top-3 right-3 p-1 rounded hover:bg-gray-100 text-gray-500">
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        </button>
         <div>
           <h1 className="text-sm font-bold text-gray-900 leading-snug">Japan FatFIRE Optimizer</h1>
           <p className="text-xs text-gray-400">Real 2026 ¥ · Age {params.startAge} → 90</p>
@@ -1478,9 +1542,18 @@ export default function FatFIREOptimizer() {
           <Toggle label="Show 年金 Nenkin annotation" checked={params.showNenkin} onChange={v=>setParam('showNenkin',v)} />
         </Section>
       </aside>
+      {sidebarOpen && <div className="fixed inset-0 bg-black/30 z-30 lg:hidden" onClick={() => setSidebarOpen(false)} />}
 
       {/* ── Main ───────────────────────────────────────────────────────────── */}
       <main className="flex-1 flex flex-col overflow-hidden">
+        <div className="lg:hidden flex items-center gap-3 px-4 py-2 bg-white border-b">
+          <button onClick={() => setSidebarOpen(!sidebarOpen)} className="p-1.5 rounded hover:bg-gray-100">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
+            </svg>
+          </button>
+          <span className="text-sm font-bold text-gray-900">Japan FatFIRE Optimizer</span>
+        </div>
         {/* Feature 10: Progress Tracker */}
         <ProgressTracker simData={simData} params={params} tracker={tracker} setTracker={setTracker} />
 
@@ -1535,13 +1608,15 @@ export default function FatFIREOptimizer() {
         {/* Tab content */}
         <div className="flex-1 overflow-y-auto p-6">
           <div className="bg-white rounded-lg border p-5 min-h-full">
-            {activeTab==='fatfire'    && <TabFatFire simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} setBridgePhase={setBridgePhase} appliedCuts={appliedCuts} setAppliedCuts={setAppliedCuts} scenarios={scenarios} />}
-            {activeTab==='cashflow'   && <TabCashFlow simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} />}
-            {activeTab==='networth'   && <TabNetWorth simData={simData} params={params} lifeEvents={lifeEvents} />}
-            {activeTab==='budget'     && <TabBudget simData={simData} params={params} setParam={setParam} onReset={onReset} />}
-            {activeTab==='alloc'      && <TabAllocation simData={simData} params={params} />}
-            {activeTab==='compare'    && <TabCompare simData={simData} params={params} scenarios={scenarios} />}
-            {activeTab==='montecarlo' && <TabMonteCarlo params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} />}
+            <ErrorBoundary>
+              {activeTab==='fatfire'    && <TabFatFire simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} setBridgePhase={setBridgePhase} appliedCuts={appliedCuts} setAppliedCuts={setAppliedCuts} scenarios={scenarios} />}
+              {activeTab==='cashflow'   && <TabCashFlow simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} />}
+              {activeTab==='networth'   && <TabNetWorth simData={simData} params={params} lifeEvents={lifeEvents} />}
+              {activeTab==='budget'     && <TabBudget simData={simData} params={params} setParam={setParam} onReset={onReset} />}
+              {activeTab==='alloc'      && <TabAllocation simData={simData} params={params} />}
+              {activeTab==='compare'    && <TabCompare simData={simData} params={params} scenarios={scenarios} />}
+              {activeTab==='montecarlo' && <TabMonteCarlo params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} />}
+            </ErrorBoundary>
           </div>
 
           {/* About the model */}

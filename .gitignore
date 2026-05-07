@@ -1,41 +1,36 @@
-# Dependencies
+# Node modules
 node_modules/
-.pnp
-.pnp.js
+npm-debug.log
+yarn-error.log
+package-lock.json
+yarn.lock
 
-# Testing
-coverage/
-
-# Production Build (Vite)
-dist/
-build/
-
-# Environment Variables (Keep these secret!)
+# Environment variables
 .env
 .env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env.*.local
 
-# Vite/Common Logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-.eslintcache
+# Build outputs
+dist/
+build/
+.next/
+out/
 
-# Tailwind/PostCSS
-.stylelintcache
-
-# System Files
-.DS_Store
-Thumbs.db
-
-# IDE/Editor folders
+# IDE
 .vscode/
 .idea/
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+*.swp
+*.swo
+*~
+.DS_Store
+
+# React
+*.module.css
+*.module.scss
+
+# Tailwind
+.tailwindcss/
+
+# Local config
+.claude/*
+plan.md
