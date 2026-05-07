@@ -2,7 +2,10 @@ import { Redis } from '@upstash/redis'
 import { gzipSync } from 'node:zlib'
 import { nanoid } from 'nanoid'
 
-const redis = Redis.fromEnv()
+const redis = new Redis({
+  url: process.env.KV_REST_API_URL,
+  token: process.env.KV_REST_API_TOKEN,
+})
 const MAX_PAYLOAD_BYTES = 50_000
 
 export default async function handler(req, res) {
