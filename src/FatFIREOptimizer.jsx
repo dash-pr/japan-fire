@@ -189,6 +189,20 @@ function ChartTip({ active, payload, label }) {
   )
 }
 
+function ScenarioPicker({ value, onChange, scenarios }) {
+  return (
+    <div className="flex gap-1">
+      {scenarios.map(k => (
+        <button key={k} onClick={() => onChange(k)}
+          className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${value === k ? 'text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}
+          style={value === k ? { background: SCENARIO_COLORS[k] } : undefined}>
+          {k.charAt(0).toUpperCase() + k.slice(1)}
+        </button>
+      ))}
+    </div>
+  )
+}
+
 // ─── Feature 10: Progress Tracker ─────────────────────────────────────────────
 function ProgressTracker({ simData, params, tracker, setTracker }) {
   const baseRow = tracker.enabled
@@ -1037,20 +1051,25 @@ function TabFatFire({ simData, params, lifeEvents, bridgePhase, setBridgePhase, 
 }
 
 // ─── Tab 2: Cash Flow ─────────────────────────────────────────────────────────
-function TabCashFlow({ simData, params, lifeEvents, bridgePhase }) {
-  const baseData = simData.base.filter(r=>r.age<=65)
+function TabCashFlow({ simData, params, lifeEvents, bridgePhase, scenarios }) {
+  const [sc, setSc] = useState('base')
+  const data = simData[sc] ?? simData.base
+  const baseData = data.filter(r=>r.age<=65)
   const salaryCap = baseData.find(r=>r.netMonthly>=params.netSalaryCap)
 
   const chartData = baseData.map(r=>({
     age: r.age,
-    income: displayVal(r.netMonthly, r.age, params),
+    income: r.fireCrossed ? 0 : displayVal(r.netMonthly, r.age, params),
     expenses: displayVal(r.totalExpenses+r.residenceTax, r.age, params),
-    surplus: displayVal(r.investableSurplus, r.age, params),
+    surplus: r.fireCrossed ? 0 : displayVal(r.investableSurplus, r.age, params),
   }))
 
   return (
     <div className="space-y-4">
-      <p className="text-xs text-gray-500">Base scenario · Monthly figures · Real 2026 ¥</p>
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-gray-500">Monthly figures · Real 2026 ¥</p>
+        <ScenarioPicker value={sc} onChange={setSc} scenarios={scenarios} />
+      </div>
       <div aria-label="Monthly cash flow chart" className="h-80">
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart data={chartData} margin={{top:24,right:30,left:10,bottom:0}}>
@@ -1082,9 +1101,11 @@ function TabCashFlow({ simData, params, lifeEvents, bridgePhase }) {
 }
 
 // ─── Tab 3: Net Worth ─────────────────────────────────────────────────────────
-function TabNetWorth({ simData, params, lifeEvents }) {
-  const baseFireTarget = simData.base.find(r=>r.fireCrossed)?.fatFireTarget
-  const chartData = simData.base.map(r=>({
+function TabNetWorth({ simData, params, lifeEvents, scenarios }) {
+  const [sc, setSc] = useState('base')
+  const data = simData[sc] ?? simData.base
+  const baseFireTarget = data.find(r=>r.fireCrossed)?.fatFireTarget
+  const chartData = data.map(r=>({
     age: r.age,
     iDeCo: displayVal(r.iDeCo, r.age, params),
     nisa: displayVal(r.nisa, r.age, params),
@@ -1094,6 +1115,9 @@ function TabNetWorth({ simData, params, lifeEvents }) {
   }))
   return (
     <div className="space-y-4">
+      <div className="flex justify-end">
+        <ScenarioPicker value={sc} onChange={setSc} scenarios={scenarios} />
+      </div>
       <div aria-label="Yearly net worth chart" className="h-96">
         <ResponsiveContainer width="100%" height="100%">
           <ComposedChart data={chartData} margin={{top:10,right:30,left:10,bottom:0}}>
@@ -1119,9 +1143,11 @@ function TabNetWorth({ simData, params, lifeEvents }) {
 }
 
 // ─── Tab 1: Budget ────────────────────────────────────────────────────────────
-function TabBudget({ simData, params, setParam, onReset }) {
+function TabBudget({ simData, params, setParam, onReset, scenarios }) {
   const [budgetAge, setBudgetAge] = useState(35)
-  const row = simData.base.find(r=>r.age===budgetAge) ?? simData.base[0]
+  const [sc, setSc] = useState('base')
+  const data = simData[sc] ?? simData.base
+  const row = data.find(r=>r.age===budgetAge) ?? data[0]
   const isOwner = budgetAge >= params.propertyPurchaseAge
   const annualSurplus = (row.investableSurplus ?? 0) * 12
 
