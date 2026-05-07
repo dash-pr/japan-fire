@@ -1645,8 +1645,22 @@ function TabCompare({ simData, params, scenarios }) {
 }
 
 // ─── Main component ────────────────────────────────────────────────────────────
-export default function FatFIREOptimizer() {
-  const initial = useMemo(() => loadInitialState(), [])
+export default function FatFIREOptimizer({ sharedPlanId }) {
+  const hashState = useMemo(() => loadInitialState(), [])
+  const [apiState, setApiState] = useState(null)
+  const [loading, setLoading] = useState(!!sharedPlanId && !hashState)
+
+  useEffect(() => {
+    if (sharedPlanId && !hashState) {
+      fetch(`/api/load/${sharedPlanId}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(state => { if (state?.params) setApiState({ ...state, params: migrateParams(state.params) }) })
+        .catch(() => {})
+        .finally(() => setLoading(false))
+    }
+  }, [sharedPlanId, hashState])
+
+  const initial = hashState || apiState
   const [params, setParams] = useState(initial?.params ?? DEFAULTS)
   const [lifeEvents, setLifeEvents] = useState(initial?.lifeEvents ?? [])
   const [bridgePhase, setBridgePhase] = useState(initial?.bridgePhase ?? { enabled:false, startAge:50, endAge:56, monthlyIncome:200_000 })
@@ -1661,6 +1675,24 @@ export default function FatFIREOptimizer() {
   })
   const [appliedCuts, setAppliedCuts] = useState(initial?.appliedCuts ?? {})
 
+  // Hydrate state when API response arrives (after initial render)
+  useEffect(() => {
+    if (apiState) {
+      setParams(apiState.params ?? DEFAULTS)
+      setLifeEvents(apiState.lifeEvents ?? [])
+      setBridgePhase(apiState.bridgePhase ?? { enabled:false, startAge:50, endAge:56, monthlyIncome:200_000 })
+      setSpendingPhases(apiState.spendingPhases ?? {
+        enabled: false, targetDepletionAge: 95,
+        phases: [
+          { id:1, label:'Go-Go', startAge:55, endAge:65, multiplier:1.2, swr:4.0 },
+          { id:2, label:'Slow-Go', startAge:65, endAge:75, multiplier:0.85, swr:3.5 },
+          { id:3, label:'No-Go', startAge:75, endAge:95, multiplier:0.65, swr:3.0 },
+        ],
+      })
+      setAppliedCuts(apiState.appliedCuts ?? {})
+    }
+  }, [apiState])
+
   useEffect(() => {
     setAppliedCuts({})
   }, [params.groceries, params.transport, params.personalCare, params.fineDining, params.drinking,
@@ -1673,6 +1705,7 @@ export default function FatFIREOptimizer() {
   })
   const [showSavedPlans, setShowSavedPlans] = useState(false)
   const [copyToast, setCopyToast] = useState(false)
+  const [sharing, setSharing] = useState(false)
   const [showLifeEvents, setShowLifeEvents] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
@@ -1722,10 +1755,25 @@ export default function FatFIREOptimizer() {
     return () => clearTimeout(timer)
   }, [params, lifeEvents, bridgePhase, spendingPhases, appliedCuts])
 
-  const copyShareLink = () => {
-    navigator.clipboard.writeText(window.location.href).catch(() => {})
+  const copyShareLink = async () => {
+    setSharing(true)
+    try {
+      const state = { params, lifeEvents, bridgePhase, spendingPhases, appliedCuts }
+      const res = await fetch('/api/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(state),
+      })
+      if (!res.ok) throw new Error('Save failed')
+      const { id } = await res.json()
+      const shortUrl = `${window.location.origin}/p/${id}`
+      await navigator.clipboard.writeText(shortUrl)
+    } catch {
+      navigator.clipboard.writeText(window.location.href).catch(() => {})
+    }
     setCopyToast(true)
     setTimeout(() => setCopyToast(false), 2500)
+    setSharing(false)
   }
 
   const saveSnapshot = (name) => {
@@ -1751,6 +1799,17 @@ export default function FatFIREOptimizer() {
   const baseFireRow = simData.base?.find(r=>r.fireCrossed)
   const bullFireRow = simData.bull?.find(r=>r.fireCrossed)
 
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-gray-50">
+        <div className="text-center space-y-3">
+          <div className="animate-spin w-8 h-8 border-4 border-teal-600 border-t-transparent rounded-full mx-auto" />
+          <p className="text-sm text-gray-500">Loading shared plan...</p>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex h-screen overflow-hidden bg-gray-50 font-sans text-gray-900">
       {/* ── Sidebar ─────────────────────────────────────────────────────────── */}
@@ -1767,9 +1826,9 @@ export default function FatFIREOptimizer() {
 
         {/* Feature 8: Save/Share */}
         <div className="flex gap-1.5">
-          <button onClick={copyShareLink}
-            className="flex-1 text-xs border rounded px-2 py-1.5 text-gray-600 hover:bg-gray-50 flex items-center justify-center gap-1">
-            🔗 Share
+          <button onClick={copyShareLink} disabled={sharing}
+            className="flex-1 text-xs border rounded px-2 py-1.5 text-gray-600 hover:bg-gray-50 flex items-center justify-center gap-1 disabled:opacity-50">
+            {sharing ? '...' : '🔗'} Share
           </button>
           <button onClick={()=>saveSnapshot()} className="flex-1 text-xs border rounded px-2 py-1.5 text-gray-600 hover:bg-gray-50">💾 Save</button>
           <div className="relative">
