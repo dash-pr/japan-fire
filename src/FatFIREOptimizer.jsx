@@ -936,8 +936,18 @@ function TabFatFire({ simData, params, lifeEvents, bridgePhase, setBridgePhase, 
   const [subTab, setSubTab] = useState('projection') // 'projection' | 'sensitivity'
   const defaultEndIdx = Math.min(65 - params.startAge, 90 - params.startAge)
   const [zoomRange, setZoomRange] = useState({ startIndex: 0, endIndex: defaultEndIdx })
+  const [visibleScenarios, setVisibleScenarios] = useState(new Set(scenarios))
+  useEffect(() => setVisibleScenarios(prev => {
+    const next = new Set(scenarios.filter(s => prev.has(s)))
+    return next.size > 0 ? next : new Set(scenarios)
+  }), [scenarios])
+  const toggleScenario = (k) => setVisibleScenarios(prev => {
+    const next = new Set(prev)
+    if (next.has(k)) { if (next.size > 1) next.delete(k) } else next.add(k)
+    return next
+  })
 
-  const allScenarios = scenarios
+  const allScenarios = scenarios.filter(s => visibleScenarios.has(s))
 
   const chartData = simData.base.map((row, i) => {
     const d = { age: row.age }
@@ -1026,15 +1036,16 @@ function TabFatFire({ simData, params, lifeEvents, bridgePhase, setBridgePhase, 
           </ResponsiveContainer>
         </div>
 
-        {/* Custom legend */}
-        <div className="flex flex-wrap gap-4 text-xs justify-center">
-          {allScenarios.map(k=>(
-            <div key={k} className="flex items-center gap-1.5">
+        {/* Clickable legend */}
+        <div className="flex flex-wrap gap-3 text-xs justify-center">
+          {scenarios.map(k=>(
+            <button key={k} onClick={()=>toggleScenario(k)}
+              className={`flex items-center gap-1.5 px-2 py-1 rounded transition-opacity ${visibleScenarios.has(k)?'opacity-100':'opacity-40'}`}>
               <div className="w-4 h-0.5" style={{background:C[k]}} />
               <span className="text-gray-600">
                 {k==='custom' ? (params.customScenario?.label||'Custom') : `${k.charAt(0).toUpperCase()+k.slice(1)} (${params.returns[k]}% real)`}
               </span>
-            </div>
+            </button>
           ))}
           <div className="flex items-center gap-1.5">
             <div className="w-4 border-t border-dashed border-gray-400" />
@@ -1197,6 +1208,7 @@ function TabBudget({ simData, params, setParam, onReset, scenarios }) {
           {isOwner ? 'Owner (mortgage)' : 'Renting'}
         </span>
         <span className="text-xs text-teal-600 font-medium">Investable: ¥{formatJPY(row.investableSurplus)}/mo</span>
+        <ScenarioPicker value={sc} onChange={setSc} scenarios={scenarios} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -1238,8 +1250,9 @@ function TabBudget({ simData, params, setParam, onReset, scenarios }) {
 }
 
 // ─── Tab 5: Allocation ────────────────────────────────────────────────────────
-function TabAllocation({ simData, params }) {
-  const baseData = simData.base
+function TabAllocation({ simData, params, scenarios }) {
+  const [sc, setSc] = useState('base')
+  const baseData = simData[sc] ?? simData.base
   const nisaCapAge = baseData.find(r=>r.nisaLifetimeUsed>=18_000_000)?.age
   const contribData = baseData.filter(r=>r.age<=65).map(r=>({
     age:r.age,
@@ -1256,6 +1269,9 @@ function TabAllocation({ simData, params }) {
   }))
   return (
     <div className="space-y-6">
+      <div className="flex justify-end">
+        <ScenarioPicker value={sc} onChange={setSc} scenarios={scenarios} />
+      </div>
       <div>
         <h3 className="text-sm font-semibold mb-2 text-gray-700">Annual Contributions</h3>
         <div aria-label="Annual investment contributions" className="h-52">
@@ -1951,10 +1967,10 @@ export default function FatFIREOptimizer() {
           <div className="bg-white rounded-lg border p-5 min-h-full">
             <ErrorBoundary>
               {activeTab==='fatfire'    && <TabFatFire simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} setBridgePhase={setBridgePhase} appliedCuts={appliedCuts} setAppliedCuts={setAppliedCuts} scenarios={scenarios} />}
-              {activeTab==='cashflow'   && <TabCashFlow simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} />}
-              {activeTab==='networth'   && <TabNetWorth simData={simData} params={params} lifeEvents={lifeEvents} />}
-              {activeTab==='budget'     && <TabBudget simData={simData} params={params} setParam={setParam} onReset={onReset} />}
-              {activeTab==='alloc'      && <TabAllocation simData={simData} params={params} />}
+              {activeTab==='cashflow'   && <TabCashFlow simData={simData} params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} scenarios={scenarios} />}
+              {activeTab==='networth'   && <TabNetWorth simData={simData} params={params} lifeEvents={lifeEvents} scenarios={scenarios} />}
+              {activeTab==='budget'     && <TabBudget simData={simData} params={params} setParam={setParam} onReset={onReset} scenarios={scenarios} />}
+              {activeTab==='alloc'      && <TabAllocation simData={simData} params={params} scenarios={scenarios} />}
               {activeTab==='phases'     && <TabSpendingPhases params={params} scenarios={scenarios} lifeEvents={lifeEvents} bridgePhase={bridgePhase} appliedCuts={appliedCuts} spendingPhases={spendingPhases} setSpendingPhases={setSpendingPhases} />}
               {activeTab==='compare'    && <TabCompare simData={simData} params={params} scenarios={scenarios} />}
               {activeTab==='montecarlo' && <TabMonteCarlo params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} spendingPhases={spendingPhases} />}
