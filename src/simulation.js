@@ -35,7 +35,7 @@ export function getScenarioConfig(params, key) {
     return {
       realReturn: cs.realReturn,
       mortgageRate: cs.mortgageRate,
-      mortgageHike: cs.hikeEnabled ? { newRate: cs.hikeRate, atAge: cs.hikeAge } : null,
+      mortgageRateGrowth: { annualIncrease: cs.rateIncrease, everyYears: cs.rateEveryYears, cap: cs.rateCap },
       salaryGrowthRate: cs.salaryGrowthRate,
       salaryGrowthStep: cs.salaryGrowthStep,
       inflation: cs.inflation,
@@ -47,19 +47,19 @@ export function getScenarioConfig(params, key) {
     bull: {
       realReturn: params.returns.bull,
       mortgageRate: params.initialMortgageRate,
-      mortgageHike: params.mortgageRateHikes.bull,
+      mortgageRateGrowth: params.mortgageRateGrowth.bull,
       label: 'Bull', color: SCENARIO_COLORS.bull,
     },
     base: {
       realReturn: params.returns.base,
       mortgageRate: params.initialMortgageRate,
-      mortgageHike: params.mortgageRateHikes.base,
+      mortgageRateGrowth: params.mortgageRateGrowth.base,
       label: 'Base', color: SCENARIO_COLORS.base,
     },
     bear: {
       realReturn: params.returns.bear,
       mortgageRate: params.initialMortgageRate,
-      mortgageHike: params.mortgageRateHikes.bear,
+      mortgageRateGrowth: params.mortgageRateGrowth.bear,
       label: 'Bear', color: SCENARIO_COLORS.bear,
     },
   }[key]
@@ -80,10 +80,10 @@ export const DEFAULTS = {
   propertyValue: 100_000_000,
   initialMortgageRate: 1.5,
   mortgageTerm: 35,
-  mortgageRateHikes: {
-    bear: { newRate: 3.5, atAge: 45 },
-    base: { newRate: 2.5, atAge: 50 },
-    bull: null,
+  mortgageRateGrowth: {
+    bear: { annualIncrease: 0.3, everyYears: 1, cap: 4.0 },
+    base: { annualIncrease: 0.15, everyYears: 1, cap: 3.0 },
+    bull: { annualIncrease: 0, everyYears: 1, cap: 1.5 },
   },
   partnerHousingShare: 33.33,
 
@@ -117,9 +117,9 @@ export const DEFAULTS = {
   customScenario: {
     realReturn: 5,
     mortgageRate: 1.5,
-    hikeEnabled: true,
-    hikeRate: 2.5,
-    hikeAge: 50,
+    rateIncrease: 0.2,
+    rateEveryYears: 1,
+    rateCap: 3.5,
     salaryGrowthRate: 4,
     salaryGrowthStep: 2,
     inflation: 2,
@@ -138,15 +138,15 @@ export const DEFAULTS = {
  */
 export function runSimulation(params, scCfg, opts = {}) {
   const sc = typeof scCfg === 'string' ? getScenarioConfig(params, scCfg) : scCfg
-  const { lifeEvents = [], bridgePhase = null, cutOverrides = {}, returnOverrides = null } = opts
+  const { lifeEvents = [], bridgePhase = null, cutOverrides = {}, returnOverrides = null, spendingPhases = null } = opts
 
   const p = { ...params, ...cutOverrides }
-  const endAge = 90
+  const endAge = Math.max(90, spendingPhases?.targetDepletionAge ?? 90)
   const realReturn = sc.realReturn / 100
   const inflation = (sc.inflation ?? p.inflation) / 100
   const CAPITAL_GAINS_TAX = 0.20315
   const taxableReturn = realReturn * (1 - CAPITAL_GAINS_TAX)
-  const hike = sc.mortgageHike ?? null
+  const rateGrowth = sc.mortgageRateGrowth ?? null
   const userShare = 1 - p.partnerHousingShare / 100
 
   // Use scenario-specific overrides (for custom scenario)
@@ -195,10 +195,16 @@ export function runSimulation(params, scCfg, opts = {}) {
       mortgageBalance = p.propertyValue
       mortgagePaymentMonthly = calculateMortgagePayment(p.propertyValue, currentMortgageRate, p.mortgageTerm)
     }
-    if (hike && age === hike.atAge && age >= p.propertyPurchaseAge) {
-      currentMortgageRate = hike.newRate / 100
-      const remainingYears = p.mortgageTerm - (age - p.propertyPurchaseAge)
-      mortgagePaymentMonthly = calculateMortgagePayment(mortgageBalance, currentMortgageRate, remainingYears)
+    if (age > p.propertyPurchaseAge && age < p.propertyPurchaseAge + p.mortgageTerm && rateGrowth && rateGrowth.annualIncrease > 0) {
+      const yearsSincePurchase = age - p.propertyPurchaseAge
+      const increments = Math.floor(yearsSincePurchase / rateGrowth.everyYears)
+      const baseRate = (sc.mortgageRate ?? p.initialMortgageRate) / 100
+      currentMortgageRate = Math.min(rateGrowth.cap / 100, baseRate + (rateGrowth.annualIncrease / 100) * increments)
+      // 5-year rule: payment recalculates every 5 years
+      if (yearsSincePurchase % 5 === 0) {
+        const remainingYears = p.mortgageTerm - yearsSincePurchase
+        mortgagePaymentMonthly = calculateMortgagePayment(mortgageBalance, currentMortgageRate, remainingYears)
+      }
     }
     const mortgagePaidOff = age >= p.propertyPurchaseAge + p.mortgageTerm
     if (mortgagePaidOff) { mortgageBalance = 0; mortgagePaymentMonthly = 0 }
@@ -253,7 +259,12 @@ export function runSimulation(params, scCfg, opts = {}) {
 
       if (age === p.propertyPurchaseAge) taxable = Math.max(0, taxable - 650_000)
     } else {
-      const retirementExpenses = (totalExpenses + residenceTax) * 12
+      let phaseMultiplier = 1.0
+      if (spendingPhases?.enabled) {
+        const phase = spendingPhases.phases.find(ph => age >= ph.startAge && age < ph.endAge)
+        if (phase) phaseMultiplier = phase.multiplier
+      }
+      const retirementExpenses = (totalExpenses + residenceTax) * 12 * phaseMultiplier
       const nenkinIncome = (p.showNenkin && age >= 65) ? (p.nenkinMonthly / deflator) * 12 : 0
       let withdrawal = Math.max(0, retirementExpenses - nenkinIncome)
       const fromTaxable = Math.min(taxable, withdrawal)
@@ -329,6 +340,33 @@ export function runSimulation(params, scCfg, opts = {}) {
       fireAge,
       currentMortgageRate: Math.round(currentMortgageRate * 10000) / 100,
       inBridge,
+      phaseMultiplier: fireCrossed ? (spendingPhases?.enabled ? (spendingPhases.phases.find(ph => age >= ph.startAge && age < ph.endAge)?.multiplier ?? 1) : 1) : null,
+    })
+  }
+  return results
+}
+
+// ─── Max sustainable withdrawal calculator ────────────────────────────────────
+export function computeMaxSustainable(params, scenarioKeys, opts, spendingPhases) {
+  const results = {}
+  for (const key of scenarioKeys) {
+    const sc = getScenarioConfig(params, key)
+    results[key] = spendingPhases.phases.map(phase => {
+      let lo = 0.1, hi = 3.0
+      for (let i = 0; i < 20; i++) {
+        const mid = (lo + hi) / 2
+        const testPhases = {
+          ...spendingPhases,
+          phases: spendingPhases.phases.map(p =>
+            p.id === phase.id ? { ...p, multiplier: mid } : p
+          ),
+        }
+        const result = runSimulation(params, sc, { ...opts, spendingPhases: testPhases })
+        const targetAge = spendingPhases.targetDepletionAge ?? 95
+        const row = result.find(r => r.age === targetAge)
+        if ((row?.totalPortfolio ?? 0) > 0) lo = mid; else hi = mid
+      }
+      return { phaseId: phase.id, maxMultiplier: Math.round(lo * 100) / 100 }
     })
   }
   return results

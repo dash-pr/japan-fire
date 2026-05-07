@@ -13,10 +13,11 @@ function generateReturns(meanReturn, sigma, numYears) {
 
 export async function runMonteCarlo(params, scenarioKey, numSims = 500, opts = {}, progressCallback = null) {
   const sc = getScenarioConfig(params, scenarioKey)
-  const { lifeEvents = [], bridgePhase = null } = opts
+  const { lifeEvents = [], bridgePhase = null, spendingPhases = null } = opts
   const sigma = 0.08
   const meanReturn = sc.realReturn / 100
-  const numYears = 90 - params.startAge + 1
+  const endAge = Math.max(90, spendingPhases?.targetDepletionAge ?? 90)
+  const numYears = endAge - params.startAge + 1
 
   const ages = Array.from({ length: numYears }, (_, i) => params.startAge + i)
   const allPaths = []
@@ -27,7 +28,7 @@ export async function runMonteCarlo(params, scenarioKey, numSims = 500, opts = {
     const batch = Math.min(chunkSize, numSims - i)
     for (let j = 0; j < batch; j++) {
       const returnOverrides = generateReturns(meanReturn, sigma, numYears)
-      const path = runSimulation(params, sc, { lifeEvents, bridgePhase, returnOverrides })
+      const path = runSimulation(params, sc, { lifeEvents, bridgePhase, spendingPhases, returnOverrides })
       allPaths.push(path)
       const fireRow = path.find(r => r.fireCrossed)
       fireAges.push(fireRow ? fireRow.age : null)

@@ -2,9 +2,9 @@ import React, { useMemo, useState, useEffect, useCallback, useRef } from 'react'
 import {
   LineChart, Line, AreaChart, Area, BarChart, Bar,
   ComposedChart, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  CartesianGrid, ReferenceLine, ReferenceDot, Cell, PieChart, Pie,
+  CartesianGrid, ReferenceLine, ReferenceDot, Cell, PieChart, Pie, Brush,
 } from 'recharts'
-import { DEFAULTS, runSimulation, getScenarioConfig, SCENARIO_COLORS, computeResidenceTax } from './simulation.js'
+import { DEFAULTS, runSimulation, getScenarioConfig, SCENARIO_COLORS, computeResidenceTax, computeMaxSustainable } from './simulation.js'
 import { generateSuggestions, computeGapMetrics, EXPENSE_CATEGORIES, TIER_ICONS, costInWorkingYears } from './gapAnalysis.js'
 import { runMonteCarlo } from './monteCarlo.js'
 
@@ -20,6 +20,7 @@ const ALL_TABS = [
   { id:'networth', label:'Net Worth' },
   { id:'budget',   label:'Budget' },
   { id:'alloc',    label:'Allocation' },
+  { id:'phases',   label:'Spending Phases' },
   { id:'compare',  label:'Scenarios' },
   { id:'montecarlo', label:'Probability' },
 ]
@@ -54,9 +55,41 @@ function loadInitialState() {
   const hash = window.location.hash.slice(1)
   if (hash) {
     const s = decodeState(hash)
-    if (s?.params) return s
+    if (s?.params) { s.params = migrateParams(s.params); return s }
   }
   return null
+}
+function migrateParams(p) {
+  if (p.mortgageRateHikes && !p.mortgageRateGrowth) {
+    const initial = p.initialMortgageRate ?? 1.5
+    const purchase = p.propertyPurchaseAge ?? 40
+    const convert = (hike) => {
+      if (!hike) return { annualIncrease: 0, everyYears: 1, cap: initial }
+      const years = Math.max(1, hike.atAge - purchase)
+      return { annualIncrease: Math.round(((hike.newRate - initial) / years) * 100) / 100, everyYears: 1, cap: hike.newRate }
+    }
+    p.mortgageRateGrowth = {
+      bear: convert(p.mortgageRateHikes.bear),
+      base: convert(p.mortgageRateHikes.base),
+      bull: convert(p.mortgageRateHikes.bull),
+    }
+    delete p.mortgageRateHikes
+  }
+  if (p.customScenario && 'hikeEnabled' in p.customScenario) {
+    const cs = p.customScenario
+    const initial = cs.mortgageRate ?? 1.5
+    if (cs.hikeEnabled && cs.hikeRate) {
+      const years = Math.max(1, (cs.hikeAge ?? 50) - (p.propertyPurchaseAge ?? 40))
+      cs.rateIncrease = Math.round(((cs.hikeRate - initial) / years) * 100) / 100
+      cs.rateCap = cs.hikeRate
+    } else {
+      cs.rateIncrease = 0
+      cs.rateCap = initial
+    }
+    cs.rateEveryYears = 1
+    delete cs.hikeEnabled; delete cs.hikeRate; delete cs.hikeAge
+  }
+  return p
 }
 
 // ─── Utilities ─────────────────────────────────────────────────────────────────
@@ -741,10 +774,16 @@ function BudgetSettings({ params, setParam, onReset }) {
             </div>
           </div>
 
-          <button onClick={onReset}
-            className="text-xs text-red-500 hover:text-red-700 underline">
-            Reset all expenses to defaults
-          </button>
+          <div className="flex items-center gap-4 pt-2 border-t">
+            <button onClick={()=>setShow(false)}
+              className="px-4 py-1.5 bg-teal-600 text-white text-xs font-medium rounded hover:bg-teal-700">
+              Done — Update Budget
+            </button>
+            <button onClick={onReset}
+              className="text-xs text-red-500 hover:text-red-700 underline">
+              Reset all expenses to defaults
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -752,7 +791,7 @@ function BudgetSettings({ params, setParam, onReset }) {
 }
 
 // ─── Feature 5: Monte Carlo Tab ────────────────────────────────────────────────
-function TabMonteCarlo({ params, lifeEvents, bridgePhase }) {
+function TabMonteCarlo({ params, lifeEvents, bridgePhase, spendingPhases }) {
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState(0)
   const [result, setResult] = useState(null)
@@ -764,7 +803,7 @@ function TabMonteCarlo({ params, lifeEvents, bridgePhase }) {
     setRunning(true); setProgress(0); setResult(null)
     try {
       const res = await runMonteCarlo(params, scenario, 500,
-        { lifeEvents, bridgePhase },
+        { lifeEvents, bridgePhase, spendingPhases },
         (done, total) => setProgress(Math.round(done/total*100))
       )
       setResult(res)
@@ -881,6 +920,8 @@ function TabMonteCarlo({ params, lifeEvents, bridgePhase }) {
 // ─── Tab 4: FatFIRE Projection ────────────────────────────────────────────────
 function TabFatFire({ simData, params, lifeEvents, bridgePhase, setBridgePhase, appliedCuts, setAppliedCuts, scenarios }) {
   const [subTab, setSubTab] = useState('projection') // 'projection' | 'sensitivity'
+  const defaultEndIdx = Math.min(65 - params.startAge, 90 - params.startAge)
+  const [zoomRange, setZoomRange] = useState({ startIndex: 0, endIndex: defaultEndIdx })
 
   const allScenarios = scenarios
 
@@ -925,21 +966,34 @@ function TabFatFire({ simData, params, lifeEvents, bridgePhase, setBridgePhase, 
         {/* Bridge phase toggle */}
         <BridgePhasePanel bridgePhase={bridgePhase} setBridgePhase={setBridgePhase} params={params} />
 
-        <p className="text-xs text-gray-500">Solid = portfolio · Dashed = FatFIRE target · All in real 2026 ¥{params.showNominal?' (nominal)':''}</p>
-        <div aria-label="FatFIRE projection chart" className="h-96">
+        <div className="flex items-center justify-between">
+          <p className="text-xs text-gray-500">Solid = portfolio · Dashed = FatFIRE target · All in real 2026 ¥{params.showNominal?' (nominal)':''}</p>
+          <div className="flex items-center gap-2 text-xs">
+            <span className="text-gray-500">Zoom:</span>
+            <button onClick={()=>setZoomRange({startIndex:0,endIndex:defaultEndIdx})}
+              className={`px-2 py-0.5 rounded border ${zoomRange.endIndex===defaultEndIdx&&zoomRange.startIndex===0?'bg-teal-600 text-white border-teal-600':'border-gray-200 text-gray-600 hover:bg-gray-50'}`}>To 65</button>
+            <button onClick={()=>setZoomRange({startIndex:0,endIndex:90-params.startAge})}
+              className={`px-2 py-0.5 rounded border ${zoomRange.endIndex===90-params.startAge?'bg-teal-600 text-white border-teal-600':'border-gray-200 text-gray-600 hover:bg-gray-50'}`}>Full</button>
+            <span className="text-gray-400">or drag the range bar below</span>
+          </div>
+        </div>
+        <div aria-label="FatFIRE projection chart" className="h-[440px]">
           <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={chartData} margin={{top:10,right:30,left:10,bottom:0}}>
+            <LineChart data={chartData} margin={{top:24,right:30,left:10,bottom:30}}>
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
               <XAxis dataKey="age" tickLine={false} />
               <YAxis tickFormatter={axisM} tickLine={false} width={60} />
               <Tooltip content={<ChartTip />} />
-              <ReferenceLine x={40} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Purchase',position:'top',fontSize:10,fill:'#9ca3af'}} />
-              <ReferenceLine x={53} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Dedn ends',position:'top',fontSize:10,fill:'#9ca3af'}} />
-              <ReferenceLine x={75} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Mtg off',position:'top',fontSize:10,fill:'#9ca3af'}} />
-              {params.showNenkin && <ReferenceLine x={65} stroke="#9ca3af" strokeDasharray="2 4" label={{value:'Nenkin 65',position:'insideTopRight',fontSize:10,fill:'#9ca3af'}} />}
+              <Brush dataKey="age" height={24} stroke="#94a3b8" fill="#f8fafc" travellerWidth={8}
+                startIndex={zoomRange.startIndex} endIndex={zoomRange.endIndex}
+                onChange={range => setZoomRange(range)} />
+              <ReferenceLine x={40} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Purchase',position:'insideTopRight',fontSize:10,fill:'#9ca3af',offset:12}} />
+              <ReferenceLine x={53} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Dedn ends',position:'insideTopRight',fontSize:10,fill:'#9ca3af',offset:12}} />
+              <ReferenceLine x={75} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Mtg off',position:'insideTopRight',fontSize:10,fill:'#9ca3af',offset:12}} />
+              {params.showNenkin && <ReferenceLine x={65} stroke="#9ca3af" strokeDasharray="2 4" label={{value:'Nenkin 65',position:'insideTopRight',fontSize:10,fill:'#9ca3af',offset:12}} />}
               {lifeEvents.map(ev=>(
                 <ReferenceLine key={ev.id} x={ev.age} stroke="#6366f1" strokeDasharray="3 3"
-                  label={{value:ev.label,position:'top',fontSize:9,fill:'#6366f1'}} />
+                  label={{value:ev.label,position:'insideTopRight',fontSize:9,fill:'#6366f1',offset:12}} />
               ))}
               {allScenarios.map(k=>(
                 <React.Fragment key={k}>
@@ -997,9 +1051,9 @@ function TabCashFlow({ simData, params, lifeEvents, bridgePhase }) {
   return (
     <div className="space-y-4">
       <p className="text-xs text-gray-500">Base scenario · Monthly figures · Real 2026 ¥</p>
-      <div aria-label="Monthly cash flow chart" className="h-72">
+      <div aria-label="Monthly cash flow chart" className="h-80">
         <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart data={chartData} margin={{top:10,right:30,left:10,bottom:0}}>
+          <ComposedChart data={chartData} margin={{top:24,right:30,left:10,bottom:0}}>
             <defs>
               <linearGradient id="surplusGrad" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%" stopColor={C.bull} stopOpacity={0.25} />
@@ -1010,11 +1064,11 @@ function TabCashFlow({ simData, params, lifeEvents, bridgePhase }) {
             <XAxis dataKey="age" tickLine={false} />
             <YAxis tickFormatter={v=>`¥${(v/1000).toFixed(0)}k`} tickLine={false} width={55} />
             <Tooltip content={<ChartTip />} />
-            <ReferenceLine x={40} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Purchase',position:'top',fontSize:10,fill:'#9ca3af'}} />
-            <ReferenceLine x={53} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Dedn ends',position:'top',fontSize:10,fill:'#9ca3af'}} />
-            {salaryCap && <ReferenceLine x={salaryCap.age} stroke="#6366f1" strokeDasharray="4 2" label={{value:'Salary cap',position:'top',fontSize:10,fill:'#6366f1'}} />}
+            <ReferenceLine x={40} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Purchase',position:'insideTopRight',fontSize:10,fill:'#9ca3af',offset:12}} />
+            <ReferenceLine x={53} stroke="#9ca3af" strokeDasharray="4 2" label={{value:'Dedn ends',position:'insideTopRight',fontSize:10,fill:'#9ca3af',offset:12}} />
+            {salaryCap && <ReferenceLine x={salaryCap.age} stroke="#6366f1" strokeDasharray="4 2" label={{value:'Salary cap',position:'insideTopRight',fontSize:10,fill:'#6366f1',offset:12}} />}
             {lifeEvents.map(ev=>(
-              <ReferenceLine key={ev.id} x={ev.age} stroke="#6366f1" strokeDasharray="3 3" label={{value:ev.label,position:'top',fontSize:9,fill:'#6366f1'}} />
+              <ReferenceLine key={ev.id} x={ev.age} stroke="#6366f1" strokeDasharray="3 3" label={{value:ev.label,position:'insideTopRight',fontSize:9,fill:'#6366f1',offset:12}} />
             ))}
             <Area type="monotone" dataKey="surplus" name="Investable surplus" stroke={C.bull} strokeWidth={2} fill="url(#surplusGrad)" />
             <Line type="monotone" dataKey="income" name="Net income" stroke="#64748b" strokeWidth={2} dot={false} />
@@ -1082,6 +1136,7 @@ function TabBudget({ simData, params, setParam, onReset }) {
     { name:'Fine dining', value:row.fineDining },
     { name:'Drinking', value:row.drinking },
     { name:'Travel', value:row.travel },
+    ...(row.recurringExpenses > 0 ? [{ name:'Kids/recurring', value:row.recurringExpenses }] : []),
     { name:'Residence tax', value:row.residenceTax },
     { name:'iDeCo', value:row.iDeCoContrib },
     { name:'NISA', value:row.nisaContrib },
@@ -1226,7 +1281,247 @@ function TabAllocation({ simData, params }) {
   )
 }
 
-// ─── Tab 6: Scenario Comparison ───────────────────────────────────────────────
+// ─── Tab 6: Spending Phases ───────────────────────────────────────────────────
+function TabSpendingPhases({ params, scenarios, lifeEvents, bridgePhase, appliedCuts, spendingPhases, setSpendingPhases }) {
+  const setPhase = (id, field, val) => setSpendingPhases(sp => ({
+    ...sp,
+    phases: sp.phases.map(p => p.id === id ? { ...p, [field]: val } : p),
+  }))
+  const addPhase = () => {
+    const last = spendingPhases.phases[spendingPhases.phases.length - 1]
+    const newId = Math.max(...spendingPhases.phases.map(p => p.id)) + 1
+    setSpendingPhases(sp => ({
+      ...sp,
+      phases: [...sp.phases, { id: newId, label: `Phase ${newId}`, startAge: last?.endAge ?? 65, endAge: (last?.endAge ?? 65) + 10, multiplier: 0.8, swr: 3.5 }],
+    }))
+  }
+  const removePhase = (id) => setSpendingPhases(sp => ({ ...sp, phases: sp.phases.filter(p => p.id !== id) }))
+
+  const opts = useMemo(() => ({ lifeEvents, bridgePhase, cutOverrides: appliedCuts }), [lifeEvents, bridgePhase, appliedCuts])
+
+  const phasedSimData = useMemo(() => {
+    if (!spendingPhases.enabled) return null
+    return Object.fromEntries(scenarios.map(k => [k, runSimulation(params, k, { ...opts, spendingPhases })]))
+  }, [params, scenarios, opts, spendingPhases])
+
+  const flatSimData = useMemo(() => {
+    const flatOpts = { ...opts, spendingPhases: { enabled: false, targetDepletionAge: spendingPhases.targetDepletionAge, phases: [] } }
+    return Object.fromEntries(scenarios.map(k => [k, runSimulation(params, k, flatOpts)]))
+  }, [params, scenarios, opts, spendingPhases.targetDepletionAge])
+
+  const maxSustainable = useMemo(() => {
+    if (!spendingPhases.enabled || spendingPhases.phases.length === 0) return null
+    return computeMaxSustainable(params, scenarios, opts, spendingPhases)
+  }, [params, scenarios, opts, spendingPhases])
+
+  const [selectedScenario, setSelectedScenario] = useState('base')
+
+  const fireAge = flatSimData.base?.find(r => r.fireCrossed)?.age ?? 55
+  const baseExpenses = flatSimData.base?.find(r => r.age === fireAge)
+  const monthlyBase = baseExpenses ? (baseExpenses.totalExpenses + baseExpenses.residenceTax) : 400_000
+
+  const chartData = useMemo(() => {
+    if (!phasedSimData) return []
+    const start = fireAge
+    const end = spendingPhases.targetDepletionAge
+    return Array.from({ length: end - start + 1 }, (_, i) => {
+      const age = start + i
+      const pRow = phasedSimData[selectedScenario]?.find(r => r.age === age)
+      const fRow = flatSimData[selectedScenario]?.find(r => r.age === age)
+      const phase = spendingPhases.phases.find(ph => age >= ph.startAge && age < ph.endAge)
+      return {
+        age,
+        phasedPortfolio: pRow ? pRow.totalPortfolio / 1_000_000 : 0,
+        flatPortfolio: fRow ? fRow.totalPortfolio / 1_000_000 : 0,
+        monthlySpend: phase ? Math.round(monthlyBase * phase.multiplier) : Math.round(monthlyBase),
+      }
+    })
+  }, [phasedSimData, flatSimData, selectedScenario, fireAge, spendingPhases, monthlyBase])
+
+  const longevityData = useMemo(() => {
+    if (!spendingPhases.enabled || spendingPhases.phases.length === 0) return []
+    const goGoPhase = spendingPhases.phases[0]
+    if (!goGoPhase) return []
+    return [90, 95, 100].map(targetAge => {
+      let lo = 0.1, hi = 3.0
+      const sc = getScenarioConfig(params, 'base')
+      for (let i = 0; i < 20; i++) {
+        const mid = (lo + hi) / 2
+        const testPhases = { ...spendingPhases, targetDepletionAge: targetAge, phases: spendingPhases.phases.map(p => p.id === goGoPhase.id ? { ...p, multiplier: mid } : p) }
+        const result = runSimulation(params, sc, { ...opts, spendingPhases: testPhases })
+        const row = result.find(r => r.age === targetAge)
+        if ((row?.totalPortfolio ?? 0) > 0) lo = mid; else hi = mid
+      }
+      return { targetAge, maxMultiplier: Math.round(lo * 100) / 100, maxMonthly: Math.round(monthlyBase * lo) }
+    })
+  }, [params, opts, spendingPhases, monthlyBase])
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-bold text-gray-800">Retirement Spending Phases</h2>
+          <Toggle label="Enable" checked={spendingPhases.enabled}
+            onChange={v => setSpendingPhases(sp => ({ ...sp, enabled: v }))} />
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-sm text-gray-600">Survive to:</span>
+          <input type="number" min={80} max={105} value={spendingPhases.targetDepletionAge}
+            onChange={e => setSpendingPhases(sp => ({ ...sp, targetDepletionAge: Number(e.target.value) }))}
+            className="w-16 border rounded px-2 py-1 text-sm" />
+        </div>
+      </div>
+
+      {!spendingPhases.enabled && (
+        <p className="text-sm text-gray-500">Enable spending phases to model different withdrawal rates across retirement. Early retirees typically spend more in "Go-Go" years (travel, energy) and less in later "No-Go" years.</p>
+      )}
+
+      {spendingPhases.enabled && (
+        <>
+          {/* Phase Editor */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {spendingPhases.phases.map(phase => (
+              <div key={phase.id} className="border rounded-lg p-3 bg-gray-50 space-y-2">
+                <div className="flex items-center justify-between">
+                  <input value={phase.label} onChange={e => setPhase(phase.id, 'label', e.target.value)}
+                    className="font-semibold text-sm bg-transparent border-b border-gray-300 focus:border-teal-500 outline-none w-24" />
+                  {spendingPhases.phases.length > 1 && (
+                    <button onClick={() => removePhase(phase.id)} className="text-red-400 hover:text-red-600 text-xs">Remove</button>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <div>
+                    <label className="text-gray-500">Start age</label>
+                    <input type="number" min={30} max={100} value={phase.startAge}
+                      onChange={e => setPhase(phase.id, 'startAge', Number(e.target.value))}
+                      className="w-full border rounded px-1.5 py-0.5 mt-0.5" />
+                  </div>
+                  <div>
+                    <label className="text-gray-500">End age</label>
+                    <input type="number" min={phase.startAge + 1} max={105} value={phase.endAge}
+                      onChange={e => setPhase(phase.id, 'endAge', Number(e.target.value))}
+                      className="w-full border rounded px-1.5 py-0.5 mt-0.5" />
+                  </div>
+                </div>
+                <div className="text-xs">
+                  <label className="text-gray-500">Spending multiplier: {Math.round(phase.multiplier * 100)}%</label>
+                  <input type="range" min={0.3} max={2.0} step={0.05} value={phase.multiplier}
+                    onChange={e => setPhase(phase.id, 'multiplier', Number(e.target.value))}
+                    className="w-full h-1.5 accent-teal-600" />
+                  <div className="text-teal-700 font-medium">¥{formatJPY(monthlyBase * phase.multiplier)}/mo</div>
+                </div>
+                <div className="text-xs">
+                  <label className="text-gray-500">Phase SWR: {phase.swr}%</label>
+                  <input type="range" min={2.5} max={5.0} step={0.1} value={phase.swr}
+                    onChange={e => setPhase(phase.id, 'swr', Number(e.target.value))}
+                    className="w-full h-1.5 accent-teal-600" />
+                </div>
+              </div>
+            ))}
+          </div>
+          <button onClick={addPhase} className="text-sm text-teal-600 hover:text-teal-800 font-medium">+ Add Phase</button>
+
+          {/* Max Sustainable Withdrawal */}
+          {maxSustainable && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-gray-700">Max Sustainable Withdrawal</h3>
+                <div className="flex gap-1">
+                  {scenarios.map(k => (
+                    <button key={k} onClick={() => setSelectedScenario(k)}
+                      className={`px-2 py-0.5 rounded text-xs font-medium ${selectedScenario === k ? 'bg-teal-100 text-teal-800' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                      {k.charAt(0).toUpperCase() + k.slice(1)}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {spendingPhases.phases.map(phase => {
+                  const ms = maxSustainable[selectedScenario]?.find(m => m.phaseId === phase.id)
+                  const headroom = ms ? Math.round((ms.maxMultiplier - phase.multiplier) * 100) : 0
+                  const pct = ms ? Math.min(100, (phase.multiplier / ms.maxMultiplier) * 100) : 100
+                  const color = headroom > 20 ? 'bg-green-500' : headroom > 5 ? 'bg-amber-500' : 'bg-red-500'
+                  return (
+                    <div key={phase.id} className="border rounded-lg p-3 bg-white space-y-1.5">
+                      <div className="text-sm font-semibold text-gray-700">{phase.label} ({phase.startAge}-{phase.endAge})</div>
+                      <div className="text-xs text-gray-600">
+                        Current: {Math.round(phase.multiplier * 100)}% (¥{formatJPY(monthlyBase * phase.multiplier)}/mo)
+                      </div>
+                      <div className="text-xs text-gray-600">
+                        Max: {ms ? `${Math.round(ms.maxMultiplier * 100)}% (¥${formatJPY(monthlyBase * ms.maxMultiplier)}/mo)` : '...'}
+                      </div>
+                      <div className="w-full bg-gray-200 rounded-full h-2">
+                        <div className={`h-2 rounded-full ${color}`} style={{ width: `${pct}%` }} />
+                      </div>
+                      <div className={`text-xs font-medium ${headroom > 20 ? 'text-green-700' : headroom > 5 ? 'text-amber-700' : 'text-red-700'}`}>
+                        Headroom: {headroom > 0 ? '+' : ''}{headroom}%
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Portfolio Chart */}
+          {chartData.length > 0 && (
+            <div className="space-y-2">
+              <h3 className="text-sm font-bold text-gray-700">Portfolio Trajectory: Phased vs Flat SWR ({selectedScenario})</h3>
+              <div className="h-80" aria-label="Spending phases portfolio chart">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 10, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                    <XAxis dataKey="age" tickLine={false} />
+                    <YAxis yAxisId="left" tickFormatter={v => `¥${v.toFixed(0)}M`} tickLine={false} width={60} />
+                    <YAxis yAxisId="right" orientation="right" tickFormatter={v => `¥${(v/1000).toFixed(0)}k`} tickLine={false} width={60} />
+                    <Tooltip content={({ active, payload }) => {
+                      if (!active || !payload?.length) return null
+                      const d = payload[0].payload
+                      return (
+                        <div className="bg-white border rounded shadow px-3 py-2 text-xs space-y-0.5">
+                          <div className="font-semibold">Age {d.age}</div>
+                          <div className="text-teal-700">Phased: ¥{d.phasedPortfolio.toFixed(1)}M</div>
+                          <div className="text-gray-500">Flat SWR: ¥{d.flatPortfolio.toFixed(1)}M</div>
+                          <div className="text-indigo-600">Spend: ¥{formatJPY(d.monthlySpend)}/mo</div>
+                        </div>
+                      )
+                    }} />
+                    <Area yAxisId="right" type="stepAfter" dataKey="monthlySpend" fill="#e0e7ff" stroke="#6366f1" strokeWidth={1} fillOpacity={0.3} name="Monthly spend" />
+                    <Line yAxisId="left" type="monotone" dataKey="phasedPortfolio" stroke="#0d9488" strokeWidth={2} dot={false} name="Phased" />
+                    <Line yAxisId="left" type="monotone" dataKey="flatPortfolio" stroke="#9ca3af" strokeWidth={1.5} strokeDasharray="6 3" dot={false} name="Flat SWR" />
+                    {params.showNenkin && <ReferenceLine x={65} yAxisId="left" stroke="#9ca3af" strokeDasharray="4 2" label={{ value: 'Nenkin', position: 'insideTopRight', fontSize: 10, fill: '#9ca3af' }} />}
+                    {spendingPhases.phases.map((ph, i) => i > 0 && (
+                      <ReferenceLine key={ph.id} x={ph.startAge} yAxisId="left" stroke="#cbd5e1" strokeDasharray="3 2" label={{ value: ph.label, position: 'insideTopRight', fontSize: 9, fill: '#64748b' }} />
+                    ))}
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+
+          {/* Longevity Sensitivity */}
+          {longevityData.length > 0 && (
+            <div className="space-y-2">
+              <h3 className="text-sm font-bold text-gray-700">Longevity Sensitivity: Max "{spendingPhases.phases[0]?.label}" Spending</h3>
+              <p className="text-xs text-gray-500">How much can you spend in your first retirement phase if you must survive to different ages? (Base scenario)</p>
+              <div className="grid grid-cols-3 gap-3">
+                {longevityData.map(d => (
+                  <div key={d.targetAge} className="border rounded-lg p-3 text-center bg-gray-50">
+                    <div className="text-xs text-gray-500">Survive to {d.targetAge}</div>
+                    <div className="text-lg font-bold text-gray-800">{Math.round(d.maxMultiplier * 100)}%</div>
+                    <div className="text-sm text-teal-700">¥{formatJPY(d.maxMonthly)}/mo</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ─── Tab 7: Scenario Comparison ───────────────────────────────────────────────
 function TabCompare({ simData, params, scenarios }) {
   const summary = scenarios.map(k=>{
     const series = simData[k]
@@ -1313,6 +1608,15 @@ export default function FatFIREOptimizer() {
   const [params, setParams] = useState(initial?.params ?? DEFAULTS)
   const [lifeEvents, setLifeEvents] = useState(initial?.lifeEvents ?? [])
   const [bridgePhase, setBridgePhase] = useState(initial?.bridgePhase ?? { enabled:false, startAge:50, endAge:56, monthlyIncome:200_000 })
+  const [spendingPhases, setSpendingPhases] = useState(initial?.spendingPhases ?? {
+    enabled: false,
+    targetDepletionAge: 95,
+    phases: [
+      { id: 1, label: 'Go-Go', startAge: 55, endAge: 65, multiplier: 1.2, swr: 4.0 },
+      { id: 2, label: 'Slow-Go', startAge: 65, endAge: 75, multiplier: 0.85, swr: 3.5 },
+      { id: 3, label: 'No-Go', startAge: 75, endAge: 95, multiplier: 0.65, swr: 3.0 },
+    ],
+  })
   const [appliedCuts, setAppliedCuts] = useState(initial?.appliedCuts ?? {})
 
   useEffect(() => {
@@ -1332,11 +1636,11 @@ export default function FatFIREOptimizer() {
 
   const setParam = useCallback((key, val) => setParams(p => ({ ...p, [key]: val })), [])
   const setReturn_ = useCallback((s, v) => setParams(p => ({ ...p, returns: { ...p.returns, [s]: v } })), [])
-  const setHike = useCallback((s, field, v) => setParams(p => ({
+  const setRateGrowth = useCallback((s, field, v) => setParams(p => ({
     ...p,
-    mortgageRateHikes: {
-      ...p.mortgageRateHikes,
-      [s]: p.mortgageRateHikes[s] ? { ...p.mortgageRateHikes[s], [field]: v } : null,
+    mortgageRateGrowth: {
+      ...p.mortgageRateGrowth,
+      [s]: { ...p.mortgageRateGrowth[s], [field]: v },
     },
   })), [])
   const setCustom = useCallback((field, val) => setParams(p => ({
@@ -1369,12 +1673,12 @@ export default function FatFIREOptimizer() {
   // URL persistence (debounced)
   useEffect(() => {
     const timer = setTimeout(() => {
-      const state = { params, lifeEvents, bridgePhase, appliedCuts }
+      const state = { params, lifeEvents, bridgePhase, spendingPhases, appliedCuts }
       const encoded = encodeState(state)
       if (encoded) window.location.hash = encoded
     }, 500)
     return () => clearTimeout(timer)
-  }, [params, lifeEvents, bridgePhase, appliedCuts])
+  }, [params, lifeEvents, bridgePhase, spendingPhases, appliedCuts])
 
   const copyShareLink = () => {
     navigator.clipboard.writeText(window.location.href).catch(() => {})
@@ -1383,16 +1687,21 @@ export default function FatFIREOptimizer() {
   }
 
   const saveSnapshot = (name) => {
-    const snap = { name: name || `Plan ${new Date().toLocaleDateString()}`, date: new Date().toISOString(), params, lifeEvents, bridgePhase }
+    const snap = { name: name || `Plan ${new Date().toLocaleDateString()}`, date: new Date().toISOString(), params, lifeEvents, bridgePhase, spendingPhases }
     const plans = [...savedPlans.slice(0, 4), snap]
     localStorage.setItem('fatfire-plans', JSON.stringify(plans))
     setSavedPlans(plans)
     setShowSavedPlans(false)
   }
   const loadSnapshot = (snap) => {
-    setParams(snap.params ?? DEFAULTS)
+    setParams(migrateParams(snap.params ?? DEFAULTS))
     setLifeEvents(snap.lifeEvents ?? [])
     setBridgePhase(snap.bridgePhase ?? { enabled:false, startAge:50, endAge:56, monthlyIncome:200_000 })
+    setSpendingPhases(snap.spendingPhases ?? { enabled:false, targetDepletionAge:95, phases:[
+      { id:1, label:'Go-Go', startAge:55, endAge:65, multiplier:1.2, swr:4.0 },
+      { id:2, label:'Slow-Go', startAge:65, endAge:75, multiplier:0.85, swr:3.5 },
+      { id:3, label:'No-Go', startAge:75, endAge:95, multiplier:0.65, swr:3.0 },
+    ]})
     setShowSavedPlans(false)
   }
 
@@ -1468,14 +1777,22 @@ export default function FatFIREOptimizer() {
           <SliderRow label="Mortgage term (years)" value={params.mortgageTerm} min={10} max={35} step={5} unit="yr" decimals={0} onChange={v=>setParam('mortgageTerm',v)} />
           <SliderRow label="Partner housing share" value={params.partnerHousingShare} min={0} max={50} step={1} unit="%" decimals={0} onChange={v=>setParam('partnerHousingShare',v)} />
           <div className="border-t pt-2 space-y-2">
-            <p className="text-xs text-gray-500 font-medium">Bear rate hike</p>
-            <SliderRow label="New rate" value={params.mortgageRateHikes.bear?.newRate??3.5} min={1} max={6} step={0.25} unit="%" onChange={v=>setHike('bear','newRate',v)} />
-            <SliderRow label="At age" value={params.mortgageRateHikes.bear?.atAge??45} min={41} max={70} step={1} unit="" decimals={0} onChange={v=>setHike('bear','atAge',v)} />
+            <p className="text-xs text-gray-500 font-medium">Bear rate growth (5yr rule)</p>
+            <SliderRow label="Increase" value={params.mortgageRateGrowth.bear?.annualIncrease??0.3} min={0} max={1} step={0.05} unit="%/yr" onChange={v=>setRateGrowth('bear','annualIncrease',v)} />
+            <SliderRow label="Every" value={params.mortgageRateGrowth.bear?.everyYears??1} min={1} max={5} step={1} unit="yr" decimals={0} onChange={v=>setRateGrowth('bear','everyYears',v)} />
+            <SliderRow label="Cap" value={params.mortgageRateGrowth.bear?.cap??4.0} min={1} max={6} step={0.25} unit="%" onChange={v=>setRateGrowth('bear','cap',v)} />
           </div>
           <div className="border-t pt-2 space-y-2">
-            <p className="text-xs text-gray-500 font-medium">Base rate hike</p>
-            <SliderRow label="New rate" value={params.mortgageRateHikes.base?.newRate??2.5} min={1} max={6} step={0.25} unit="%" onChange={v=>setHike('base','newRate',v)} />
-            <SliderRow label="At age" value={params.mortgageRateHikes.base?.atAge??50} min={41} max={70} step={1} unit="" decimals={0} onChange={v=>setHike('base','atAge',v)} />
+            <p className="text-xs text-gray-500 font-medium">Base rate growth (5yr rule)</p>
+            <SliderRow label="Increase" value={params.mortgageRateGrowth.base?.annualIncrease??0.15} min={0} max={1} step={0.05} unit="%/yr" onChange={v=>setRateGrowth('base','annualIncrease',v)} />
+            <SliderRow label="Every" value={params.mortgageRateGrowth.base?.everyYears??1} min={1} max={5} step={1} unit="yr" decimals={0} onChange={v=>setRateGrowth('base','everyYears',v)} />
+            <SliderRow label="Cap" value={params.mortgageRateGrowth.base?.cap??3.0} min={1} max={6} step={0.25} unit="%" onChange={v=>setRateGrowth('base','cap',v)} />
+          </div>
+          <div className="border-t pt-2 space-y-2">
+            <p className="text-xs text-gray-500 font-medium">Bull rate growth (5yr rule)</p>
+            <SliderRow label="Increase" value={params.mortgageRateGrowth.bull?.annualIncrease??0} min={0} max={1} step={0.05} unit="%/yr" onChange={v=>setRateGrowth('bull','annualIncrease',v)} />
+            <SliderRow label="Every" value={params.mortgageRateGrowth.bull?.everyYears??1} min={1} max={5} step={1} unit="yr" decimals={0} onChange={v=>setRateGrowth('bull','everyYears',v)} />
+            <SliderRow label="Cap" value={params.mortgageRateGrowth.bull?.cap??1.5} min={1} max={6} step={0.25} unit="%" onChange={v=>setRateGrowth('bull','cap',v)} />
           </div>
         </Section>
 
@@ -1525,11 +1842,9 @@ export default function FatFIREOptimizer() {
               </div>
               <SliderRow label="Real return" value={params.customScenario.realReturn} min={0} max={12} step={0.5} unit="%" onChange={v=>setCustom('realReturn',v)} />
               <SliderRow label="Mortgage rate" value={params.customScenario.mortgageRate} min={0.5} max={5} step={0.1} unit="%" onChange={v=>setCustom('mortgageRate',v)} />
-              <Toggle label="Rate hike" checked={params.customScenario.hikeEnabled} onChange={v=>setCustom('hikeEnabled',v)} />
-              {params.customScenario.hikeEnabled && <>
-                <SliderRow label="Hike rate" value={params.customScenario.hikeRate} min={1} max={6} step={0.25} unit="%" onChange={v=>setCustom('hikeRate',v)} />
-                <SliderRow label="Hike at age" value={params.customScenario.hikeAge} min={41} max={70} step={1} unit="" decimals={0} onChange={v=>setCustom('hikeAge',v)} />
-              </>}
+              <SliderRow label="Rate increase" value={params.customScenario.rateIncrease??0.2} min={0} max={1} step={0.05} unit="%/yr" onChange={v=>setCustom('rateIncrease',v)} />
+              <SliderRow label="Every" value={params.customScenario.rateEveryYears??1} min={1} max={5} step={1} unit="yr" decimals={0} onChange={v=>setCustom('rateEveryYears',v)} />
+              <SliderRow label="Rate cap" value={params.customScenario.rateCap??3.5} min={1} max={6} step={0.25} unit="%" onChange={v=>setCustom('rateCap',v)} />
               <SliderRow label="Salary growth %" value={params.customScenario.salaryGrowthRate} min={0} max={10} step={0.5} unit="%" onChange={v=>setCustom('salaryGrowthRate',v)} />
               <SliderRow label="Salary step (yr)" value={params.customScenario.salaryGrowthStep} min={1} max={4} step={1} unit="yr" decimals={0} onChange={v=>setCustom('salaryGrowthStep',v)} />
               <SliderRow label="Inflation" value={params.customScenario.inflation} min={0} max={5} step={0.25} unit="%" onChange={v=>setCustom('inflation',v)} />
@@ -1614,8 +1929,9 @@ export default function FatFIREOptimizer() {
               {activeTab==='networth'   && <TabNetWorth simData={simData} params={params} lifeEvents={lifeEvents} />}
               {activeTab==='budget'     && <TabBudget simData={simData} params={params} setParam={setParam} onReset={onReset} />}
               {activeTab==='alloc'      && <TabAllocation simData={simData} params={params} />}
+              {activeTab==='phases'     && <TabSpendingPhases params={params} scenarios={scenarios} lifeEvents={lifeEvents} bridgePhase={bridgePhase} appliedCuts={appliedCuts} spendingPhases={spendingPhases} setSpendingPhases={setSpendingPhases} />}
               {activeTab==='compare'    && <TabCompare simData={simData} params={params} scenarios={scenarios} />}
-              {activeTab==='montecarlo' && <TabMonteCarlo params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} />}
+              {activeTab==='montecarlo' && <TabMonteCarlo params={params} lifeEvents={lifeEvents} bridgePhase={bridgePhase} spendingPhases={spendingPhases} />}
             </ErrorBoundary>
           </div>
 
@@ -1625,7 +1941,7 @@ export default function FatFIREOptimizer() {
             <div className="mt-3 space-y-2 leading-relaxed">
               <p><strong>Income:</strong> Net monthly salary is post income-tax withholding, 厚生年金, 健康保険, 雇用保険. Only 住民税 (residence tax) is set aside separately, interpolated from ¥46k/mo at ¥650k net to ¥100,583/mo at ¥995k net cap.</p>
               <p><strong>Tax wrappers:</strong> iDeCo (¥23k or ¥12k/mo, locked until 60) → NISA tsumitate (¥100k/mo) + growth (¥200k/mo), lifetime cap ¥18M → taxable brokerage. All returns modelled as real annual returns.</p>
-              <p><strong>Mortgage:</strong> ¥100M at variable rate starting 1.5%, 35-year term from age 40. 住宅ローン控除: ¥17,500/mo tax benefit ages 40–52 (0.7% × ¥30M cap ÷ 12). Rate hike recalculates payment from remaining balance.</p>
+              <p><strong>Mortgage:</strong> ¥100M at variable rate starting 1.5%, 35-year term from age 40. 住宅ローン控除: ¥17,500/mo tax benefit ages 40–52 (0.7% × ¥30M cap ÷ 12). Rate increases linearly per scenario; payment recalculates every 5 years (5年ルール).</p>
               <p><strong>FatFIRE target:</strong> Annual real expenses ÷ SWR × (1 + buffer%). Drawdown order at retirement: taxable → NISA → iDeCo (age 60+).</p>
               <p><strong>Monte Carlo:</strong> 500 paths, normally distributed annual returns around the scenario mean with σ=8%. Computation is chunked asynchronously.</p>
               <p className="text-gray-400 italic">This is a planning tool, not financial advice. Projections assume constant real returns, which does not reflect actual market volatility. Consult a licensed financial adviser before making investment decisions.</p>
